@@ -1,0 +1,220 @@
+from tensorflow.keras import layers, Model, Sequential
+from __future__ import print_function
+from tensorflow import keras
+from tensorflow.keras.datasets import cifar100
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout, Activation, Flatten,BatchNormalization
+from tensorflow.keras.layers import Conv2D, MaxPooling2D
+import matplotlib.pyplot as plt
+%matplotlib inline
+
+class BasicBlock(layers.Layer):  # 继承于layer类，是一个块
+    expansion = 1     # 用于卷积核个数发生改变的卷积层
+    
+    def __init__(self, out_channel, strides=1, downsample=None, **kwargs):
+        '''
+        out_channel : 输出的数据的通道数，也就是第一层使用的卷积核的个数
+        strides: 卷积步长，默认为1 实残差结构，为2的时候是虚连接残差结构
+        downsample： 下采样操作使得图像缩小,让Block既有实残差结构也有虚残差结构
+        '''
+        super(BasicBlock, self).__init__(**kwargs)
+        self.conv1 = layers.Conv2D(out_channel, kernel_size=3, strides=strides,
+                                   padding="SAME", use_bias=False)
+        self.bn1 = layers.BatchNormalization(momentum=0.9, epsilon=1e-5)
+        # -----------------------------------------
+        self.conv2 = layers.Conv2D(out_channel, kernel_size=3, strides=1,
+                                   padding="SAME", use_bias=False)
+        self.bn2 = layers.BatchNormalization(momentum=0.9, epsilon=1e-5)
+        # -----------------------------------------
+        self.downsample = downsample
+        self.relu = layers.ReLU()
+        self.add = layers.Add()
+
+    def call(self, inputs, training=False):
+        identity = inputs
+        if self.downsample is not None:
+            identity = self.downsample(inputs)
+        x = self.conv1(inputs)
+        x = self.bn1(x, training=training)
+        x = self.relu(x)
+
+        x = self.conv2(x)
+        x = self.bn2(x, training=training)
+
+        x = self.add([identity, x])
+        x = self.relu(x)
+
+        return x
+class Bottleneck(layers.Layer):
+    expansion = 4
+    '''
+    strides  : = 1 左边的实连接结构 = 2 :对应右边实残差结构
+    out_channel : 输入/出 的数据的通道数，也就是第一层使用的卷积核的个数
+    expansion : 扩展系数：后面的卷积核的个数是前面的倍数
+    downsample : 是传入的一个下采样函数，在后面由自己定义。
+    '''
+    def __init__(self, out_channel, strides=1, downsample=None, **kwargs):
+        super(Bottleneck, self).__init__(**kwargs)
+        self.conv1 = layers.Conv2D(out_channel, kernel_size=1, use_bias=False, name="conv1")
+        self.bn1 = layers.BatchNormalization(momentum=0.9, epsilon=1e-5, name="conv1/BatchNorm")
+        # -----------------------------------------
+        self.conv2 = layers.Conv2D(out_channel, kernel_size=3, use_bias=False,
+                                   strides=strides, padding="SAME", name="conv2")
+        self.bn2 = layers.BatchNormalization(momentum=0.9, epsilon=1e-5, name="conv2/BatchNorm")
+        # -----------------------------------------
+        self.conv3 = layers.Conv2D(out_channel * self.expansion, kernel_size=1, use_bias=False, name="conv3")
+        self.bn3 = layers.BatchNormalization(momentum=0.9, epsilon=1e-5, name="conv3/BatchNorm")
+        # -----------------------------------------
+        self.relu = layers.ReLU()
+        self.downsample = downsample
+        self.add = layers.Add()
+    # 定义数据流的流向
+    def call(self, inputs, training=False):
+        identity = inputs
+        if self.downsample is not None: #None    虚残差连接结构   is not None 实残差连接结构
+            identity = self.downsample(inputs)
+        
+        x = self.conv1(inputs)
+        x = self.bn1(x, training=training)
+        x = self.relu(x)
+
+        x = self.conv2(x)
+        x = self.bn2(x, training=training)
+        x = self.relu(x)
+
+        x = self.conv3(x)
+        x = self.bn3(x, training=training)
+
+        x = self.add([x, identity])
+        x = self.relu(x)
+
+        return x
+
+def _make_layer(block, in_channel, channel, block_num, name, strides=1):
+    downsample = None
+    '''
+    in_channel : 输出的通道数
+    channel ： 本层输出的通道数
+    block_num ： 该残差块的个数  x3 x6等
+    name  : 残差结构的名字 如第一个和第二个
+    实线的残差结构都是stride 都等于1 虚线的会有等于2的时候
+    50层以上 cov2第一层对应的也是虚残差结构   但是cov2的高度宽不需要发生改变 而cov345的虚残差结构的高宽也要变
+    '''
+    if strides != 1 or in_channel != channel * block.expansion:
+        # 50 层以上的网络才会满足以上条件出现stride=2 以及in_channel != channel * block.expansion
+        downsample = Sequential([
+            layers.Conv2D(channel * block.expansion, kernel_size=1, strides=strides,
+                          use_bias=False, name="conv1"),
+            layers.BatchNormalization(momentum=0.9, epsilon=1.001e-5, name="BatchNorm")
+        ], name="shortcut")
+    # shortcut ： 竭尽分支
+
+    layers_list = []
+    layers_list.append(block(channel, downsample=downsample, strides=strides, name="unit_1"))
+
+    for index in range(1, block_num):
+        layers_list.append(block(channel, name="unit_" + str(index + 1)))
+
+    return Sequential(layers_list, name=name)
+def _resnet(block, blocks_num, im_width=224, im_height=224, num_classes=1000, include_top=True):
+    # tensorflow中的tensor通道排序是NHWC
+    # (None, 224, 224, 3)
+    '''
+    block : 传入对应的网络结构 basicblock : 18 和 34 层网络结构  bottleblock：50 101 151
+    blocks_num : 每一层 残差结构的个数  倍数
+    im_height : 高度
+    im_width : 宽度
+    num_classes : 最终的分类个数
+    include_top : 
+    '''
+    input_image = layers.Input(shape=(im_height, im_width, 3), dtype="float32")
+    x = layers.Conv2D(filters=64, kernel_size=7, strides=2,
+                      padding="SAME", use_bias=False, name="conv1")(input_image)
+    x = layers.BatchNormalization(momentum=0.9, epsilon=1e-5, name="conv1/BatchNorm")(x)
+    x = layers.ReLU()(x)
+    x = layers.MaxPool2D(pool_size=3, strides=2, padding="SAME")(x)
+    # 每调用一个make_layer 生成一个残差结构
+    x = _make_layer(block, x.shape[-1], 64, blocks_num[0], name="block1")(x)
+    x = _make_layer(block, x.shape[-1], 128, blocks_num[1], strides=2, name="block2")(x)
+    x = _make_layer(block, x.shape[-1], 256, blocks_num[2], strides=2, name="block3")(x)
+    x = _make_layer(block, x.shape[-1], 512, blocks_num[3], strides=2, name="block4")(x)
+    
+    #  进行全局平均池化操作
+    if include_top:
+        x = layers.GlobalAvgPool2D()(x)  # pool + flatten
+        x = layers.Dense(num_classes, name="logits")(x)
+        predict = layers.Softmax()(x)
+    else:
+        predict = x
+
+    model = Model(inputs=input_image, outputs=predict)
+
+    return model
+def resnet18(im_width=224, im_height=224, num_classes=1000, include_top=True):
+    return _resnet(BasicBlock, [2, 2, 2, 2], im_width, im_height, num_classes, include_top)
+def resnet34(im_width=224, im_height=224, num_classes=1000, include_top=True):
+    return _resnet(BasicBlock, [3, 4, 6, 3], im_width, im_height, num_classes, include_top)
+def resnet50(im_width=224, im_height=224, num_classes=1000, include_top=True):
+    return _resnet(Bottleneck, [3, 4, 6, 3], im_width, im_height, num_classes, include_top)
+def resnet101(im_width=224, im_height=224, num_classes=1000, include_top=True):
+    return _resnet(Bottleneck, [3, 4, 23, 3], im_width, im_height, num_classes, include_top)
+    
+(x_train, y_train), (x_test, y_test) = cifar100.load_data()
+print('x_train shape:', x_train.shape)
+print(x_train.shape[0], 'train samples')
+print(x_test.shape[0], 'test samples')
+#定义resnet 后面的网络 一层faltten 两层全连接f-c + Dropout(0.5)
+
+import tensorflow as tf
+model1 = resnet34(im_width=32, im_height=32, num_classes=100, include_top=False)
+model = Sequential(model1)      #model.add 只有在Sequential中才可以进行add
+model.add(Flatten())
+model.add(Dense(512,activation='relu'))
+model.add(BatchNormalization())
+model.add(Dropout(0.5))
+model.add(Dense(100,activation='softmax'))
+opt=tf.optimizers.Adam(learning_rate=0.01)
+model.compile(optimizer=opt,loss='sparse_categorical_crossentropy',metrics=['accuracy'])
+
+model.summary()
+model.evaluate(x_test,y_test)
+
+# Data augmentation
+train_datagen = tf.keras.preprocessing.image.ImageDataGenerator(
+    rotation_range=20, 
+    width_shift_range=0.1, # Shift picture
+    height_shift_range=0.1,
+    horizontal_flip=True, # Might has flip picture but there is no upside down thing
+    fill_mode='nearest') # Fill missing pixels
+
+train_gen = train_datagen.flow(x_train, y_train, batch_size=128)
+
+print(len(train_gen))
+
+# Train the model with the new callback
+history = model.fit(train_gen, 
+                    validation_data=(x_test,y_test), 
+                    epochs=100,
+                    # Not specify the batch_size since data is from generators (since they generate batches)
+                    steps_per_epoch=391, # Total number of steps (batches of samples) before a epoch finished, 
+                                                    # default is the number of samples (50000) divided by the batch size (32)
+                    validation_steps=x_test.shape[0])
+
+# 绘制训练 && 验证的准确率 
+plt.plot(history.history['accuracy'])
+plt.plot(history.history['val_accuracy'])
+plt.title('Model accuracy')
+plt.ylabel('Accuracy')
+plt.xlabel('Epoch')
+plt.legend(['Train', 'Test'], loc='upper left')
+plt.show()
+
+# 绘制训练 && 验证的损失值
+plt.plot(history.history['loss'])
+plt.plot(history.history['val_loss'])
+plt.title('Model loss')
+plt.ylabel('Loss')
+plt.xlabel('Epoch')
+plt.legend(['Train', 'Test'], loc='upper left')
+plt.show()
